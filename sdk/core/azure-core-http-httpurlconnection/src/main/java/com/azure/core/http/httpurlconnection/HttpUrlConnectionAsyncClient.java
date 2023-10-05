@@ -7,6 +7,7 @@ import com.azure.core.util.logging.ClientLogger;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import com.azure.core.http.HttpHeader;
+import reactor.core.scheduler.Schedulers;
 
 import java.io.*;
 import java.net.*;
@@ -65,7 +66,8 @@ public class HttpUrlConnectionAsyncClient implements HttpClient {
         return Mono.fromCallable(() -> {
             HttpURLConnection connection = connect(httpRequest);
             Mono<HttpResponse> response = sendRequest(httpRequest, progressReporter, connection)
-                .then(Mono.fromCallable(() -> receiveResponse(httpRequest, connection)));
+                .then(Mono.fromCallable(() -> receiveResponse(httpRequest, connection)))
+                .publishOn(Schedulers.boundedElastic());
             return response.block();
         });
     }
@@ -150,7 +152,8 @@ public class HttpUrlConnectionAsyncClient implements HttpClient {
                         });
                     }
 
-                    requestSendMono = requestBody
+//                    requestSendMono = requestBody
+                    requestBody
                         .flatMap(buffer -> {
                             try {
                                 byte[] bytes = new byte[buffer.remaining()];
@@ -167,7 +170,7 @@ public class HttpUrlConnectionAsyncClient implements HttpClient {
                             } catch (IOException e) {
                                 throw new RuntimeException(e);
                             }
-                        }));
+                        })).block();
                 } catch (IOException e) {
                     break;
                 }
@@ -182,39 +185,6 @@ public class HttpUrlConnectionAsyncClient implements HttpClient {
                     + httpRequest.getHttpMethod()));
         }
         return requestSendMono;
-//        return requestSendMono.then(Mono.fromCallable(() -> {
-//            // Read response
-//            try {
-//                int responseCode = connection.getResponseCode();
-//
-//                Map<String, List<String>> responseHeadersMap = new HashMap<>();
-//                for (Map.Entry<String, List<String>> entry : connection.getHeaderFields().entrySet()) {
-//                    if (entry.getKey() != null) {
-//                        responseHeadersMap.put(entry.getKey(), entry.getValue());
-//                    }
-//                }
-//
-//                ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
-//                try (InputStream errorStream = connection.getErrorStream()) {
-//                    InputStream inputStream = (errorStream == null) ? connection.getInputStream() : errorStream;
-//                    byte[] buffer = new byte[1024];
-//                    int length;
-//                    while ((length = inputStream.read(buffer)) != -1) {
-//                        outputStream.write(buffer, 0, length);
-//                    }
-//                }
-//
-//                connection.disconnect();
-//
-//                return new HttpUrlConnectionResponse(
-//                    httpRequest,
-//                    responseCode,
-//                    responseHeadersMap,
-//                    Flux.just(ByteBuffer.wrap(outputStream.toByteArray())));
-//            } catch (IOException e) {
-//                throw new RuntimeException(e);
-//            }
-//        }));
     }
 
     private HttpResponse receiveResponse(HttpRequest httpRequest, HttpURLConnection connection) {
