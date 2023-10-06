@@ -12,6 +12,8 @@ import reactor.core.scheduler.Schedulers;
 import java.io.*;
 import java.net.*;
 import java.nio.ByteBuffer;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
 import java.util.*;
 
@@ -70,12 +72,11 @@ public class HttpUrlConnectionAsyncClient implements HttpClient {
             return sendPatchViaSocket(httpRequest);
         }
 
-        return Mono.fromCallable(() -> {
+        return Mono.defer(() -> {
             HttpURLConnection connection = connect(httpRequest);
-            Mono<HttpResponse> response = sendRequest(httpRequest, progressReporter, connection)
-                .then(Mono.fromCallable(() -> receiveResponse(httpRequest, connection)))
+            return sendRequest(httpRequest, progressReporter, connection)
+                .then(Mono.defer(() -> Mono.fromCallable(() -> receiveResponse(httpRequest, connection))))
                 .publishOn(Schedulers.boundedElastic());
-            return response.block();
         });
     }
 
@@ -100,6 +101,9 @@ public class HttpUrlConnectionAsyncClient implements HttpClient {
     /**
      * Open a connection based on the HttpRequest URL
      *
+     * If a proxy is specified, the authorization type will default to 'Basic' unless Digest authentication is
+     * specified in the 'Authorization' header.
+     *
      * @param httpRequest The HTTP Request being sent
      * @return The HttpURLConnection object
      */
@@ -116,9 +120,23 @@ public class HttpUrlConnectionAsyncClient implements HttpClient {
                     connection = (HttpURLConnection) url.openConnection(proxy);
 
                     if (proxyOptions.getUsername() != null && proxyOptions.getPassword() != null) {
-                        String authString = proxyOptions.getUsername() + ":" + proxyOptions.getPassword();
-                        String authStringEnc = Base64.getEncoder().encodeToString(authString.getBytes());
-                        connection.setRequestProperty("Proxy-Authorization", "Basic " + authStringEnc);
+                        String token = httpRequest.getHeaders().getValue(HttpHeaderName.AUTHORIZATION);
+                        if (token != null && token.startsWith("Digest")) {
+                            MessageDigest messageDigest = null;
+                            try {
+                                messageDigest = MessageDigest.getInstance("SHA-256");
+                            } catch (NoSuchAlgorithmException e) {
+                                e.printStackTrace();
+                            }
+                            String authString = proxyOptions.getUsername() + ":" + proxyOptions.getPassword();
+                            messageDigest.update(authString.getBytes());
+                            String authStringEnc = Base64.getEncoder().encodeToString(messageDigest.digest());
+                            connection.setRequestProperty("Proxy-Authorization", "Digest " + authStringEnc);
+                        } else{
+                            String authString = proxyOptions.getUsername() + ":" + proxyOptions.getPassword();
+                            String authStringEnc = Base64.getEncoder().encodeToString(authString.getBytes());
+                            connection.setRequestProperty("Proxy-Authorization", "Basic " + authStringEnc);
+                        }
                     }
                 }
             } else {
@@ -134,7 +152,9 @@ public class HttpUrlConnectionAsyncClient implements HttpClient {
             // SetConnectionRequest
             try {
                 connection.setRequestMethod(httpRequest.getHttpMethod().toString());
-            } catch (ProtocolException ignored) {}
+            } catch (ProtocolException e) {
+                throw LOGGER.logExceptionAsError(new RuntimeException(e));
+            }
 
             for (HttpHeader header : httpRequest.getHeaders()) {
                 for (String value : header.getValues()) {
@@ -143,17 +163,17 @@ public class HttpUrlConnectionAsyncClient implements HttpClient {
             }
             return connection;
         } catch (IOException e) {
-            throw new RuntimeException(e);
+            throw LOGGER.logExceptionAsError(new RuntimeException(e));
         }
     }
 
     /**
-     * Sends the body content of the request asynchronously
+     * Sends the content of an HttpRequest via an HttpUrlConnection instance
      *
      * @param httpRequest The HTTP Request being sent
      * @param progressReporter A reporter for the progress of the request
-     * @param connection The HttpURLConnection we're sending to
-     * @return A Mono<Void> for us to chain off for receiving the response
+     * @param connection The HttpURLConnection that is being sent to
+     * @return A Mono<Void> to chain off for receiving the response
      */
     private Mono<Void> sendRequest(HttpRequest httpRequest, ProgressReporter progressReporter, HttpURLConnection connection) {
         Mono<Void> requestSendMono = Mono.empty();
@@ -164,31 +184,34 @@ public class HttpUrlConnectionAsyncClient implements HttpClient {
             case DELETE:
                 connection.setDoOutput(true);
 
-                // Body we're going to write to the request
-                Flux<ByteBuffer> requestBody;
+                Flux<BinaryData> requestBody;
+                BinaryData body_data = httpRequest.getBodyAsBinaryData();
 
-                // Ensure the body is either valid, or we're sending *something*
-                if (httpRequest.getBody() == null) requestBody = Flux.just(ByteBuffer.wrap(new byte[0]));
+                if (body_data == null) {
+                    requestBody = Flux.just(BinaryData.fromByteBuffer(ByteBuffer.wrap(new byte[0])));
+                }
                 else {
-                    requestBody = httpRequest.getBody();
+                    requestBody = Flux.just(body_data);
                 }
 
-                try (DataOutputStream os = new DataOutputStream(new BufferedOutputStream(connection.getOutputStream()))) {
-                    if (progressReporter != null) {
-                        requestBody = requestBody.map(buffer -> {
-                            progressReporter.reportProgress(buffer.remaining());
-                            return buffer;
+                return requestBody
+                    .flatMap(body -> {
+                        if (progressReporter != null) {
+                            progressReporter.reportProgress(body.toBytes().length);
+                        }
+
+                        return Mono.fromCallable(() -> {
+                            try (DataOutputStream os = new DataOutputStream(new BufferedOutputStream(connection.getOutputStream()))) {
+                                byte[] bytes = body.toBytes();
+                                os.write(bytes);
+                                os.flush();
+                                return Mono.just(body); // Emit the BinaryData for downstream processing if needed
+                            } catch (IOException e) {
+                                return FluxUtil.monoError(LOGGER, new RuntimeException(e));
+                            }
                         });
-                    }
-
-                    requestBody
-                        .flatMap(buffer -> {
-                            writeBody(buffer, os);
-                            return Mono.just(buffer); // Emit the buffer for downstream processing if needed
-                        }).then().block();
-                } catch (IOException e) {
-                    break;
-                }
+                    })
+                    .then();
             case GET:
             case HEAD:
             case OPTIONS:
@@ -206,7 +229,7 @@ public class HttpUrlConnectionAsyncClient implements HttpClient {
      * Receive the response from the remote server
      *
      * @param httpRequest The HTTP Request being sent
-     * @param connection The HttpURLConnection we're sending to
+     * @param connection The HttpURLConnection being sent to
      * @return A HttpResponse object
      */
     private HttpResponse receiveResponse(HttpRequest httpRequest, HttpURLConnection connection) {
@@ -242,7 +265,7 @@ public class HttpUrlConnectionAsyncClient implements HttpClient {
                 Flux.just(ByteBuffer.wrap(outputStream.toByteArray()))
             );
         } catch (IOException e) {
-            throw new RuntimeException(e);
+            throw LOGGER.logExceptionAsError(new RuntimeException(e));
         }
     }
 
